@@ -1,152 +1,142 @@
-# main.py
-from imutils import face_utils
-from utils import *
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+import cv2
+import mediapipe as mp
 import numpy as np
 import pyautogui as pyag
-import imutils
-import dlib
-import cv2
+import time
+import absl.logging
+absl.logging.set_verbosity(absl.logging.ERROR)
+
+pyag.FAILSAFE = False
+pyag.PAUSE = 0
+
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
 # Thresholds
-MOUTH_AR_THRESH = 0.6
-MOUTH_AR_CONSECUTIVE_FRAMES = 15
-EYE_AR_THRESH = 0.19
-EYE_AR_CONSECUTIVE_FRAMES = 15
-WINK_AR_DIFF_THRESH = 0.04
-WINK_AR_CLOSE_THRESH = 0.19
-WINK_CONSECUTIVE_FRAMES = 10
+MOUTH_AR_THRESH = 0.63
+MOUTH_FRAMES = 12
+EYE_CLOSE = 0.18
+SQUINT_THRESH = 0.20
+WINK_FRAMES = 8
+SQUINT_FRAMES = 10
 
-# Counters and flags
+# Counters & flags
 MOUTH_COUNTER = 0
-EYE_COUNTER = 0
 WINK_COUNTER = 0
+SQUINT_COUNTER = 0
 INPUT_MODE = False
 SCROLL_MODE = False
 ANCHOR_POINT = (0, 0)
 
-# Colors
-YELLOW = (0, 255, 255)
-RED = (0, 0, 255)
-GREEN = (0, 255, 0)
-BLUE = (255, 0, 0)
+LEFT_EYE = [33, 159, 158, 133, 153, 145]
+RIGHT_EYE = [362, 386, 387, 263, 373, 380]
+UPPER_LIP = [13, 14]
+LOWER_LIP = [308, 78]
+NOSE_TIP = 1
 
-# Load Dlib model
-shape_predictor = "shape_predictor_68_face_landmarks.dat"
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(shape_predictor)
+def eye_ratio(pts, idx):
+    d1 = np.linalg.norm(pts[idx[1]] - pts[idx[5]])
+    d2 = np.linalg.norm(pts[idx[2]] - pts[idx[4]])
+    d3 = np.linalg.norm(pts[idx[0]] - pts[idx[3]])
+    return (d1 + d2) / (2.0 * d3)
 
-(lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
-(rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
-(nStart, nEnd) = face_utils.FACIAL_LANDMARKS_IDXS["nose"]
-(mStart, mEnd) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
+def mouth_ratio(pts):
+    A = np.linalg.norm(pts[UPPER_LIP[0]] - pts[LOWER_LIP[0]])
+    B = np.linalg.norm(pts[UPPER_LIP[1]] - pts[LOWER_LIP[1]])
+    C = np.linalg.norm(pts[308] - pts[78])
+    return (A + B) / (2.0 * C)
 
-# Video Capture
-vid = cv2.VideoCapture(0)
-resolution_w, resolution_h = 1366, 768
-cam_w, cam_h = 640, 480
-unit_w, unit_h = resolution_w / cam_w, resolution_h / cam_h
+cap = cv2.VideoCapture(0)
+prev = time.time()
 
 while True:
-    ret, frame = vid.read()
-    if not ret:
-        break
+    ok, frame = cap.read()
+    if not ok: break
+
     frame = cv2.flip(frame, 1)
-    frame = imutils.resize(frame, width=cam_w)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    rects = detector(gray, 0)
+    h, w = frame.shape[:2]
+    res = face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-    if len(rects) == 0:
-        cv2.imshow("Frame", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-        continue
+    if res.multi_face_landmarks:
+        lm = np.array([[p.x * w, p.y * h] for p in res.multi_face_landmarks[0].landmark])
+        leftEAR = eye_ratio(lm, LEFT_EYE)
+        rightEAR = eye_ratio(lm, RIGHT_EYE)
+        mar = mouth_ratio(lm)
+        nose = tuple(lm[NOSE_TIP].astype(int))
 
-    rect = rects[0]
-    shape = predictor(gray, rect)
-    shape = face_utils.shape_to_np(shape)
+        LEFT_CLOSED = leftEAR < EYE_CLOSE
+        RIGHT_CLOSED = rightEAR < EYE_CLOSE
 
-    mouth = shape[mStart:mEnd]
-    leftEye = shape[lStart:lEnd]
-    rightEye = shape[rStart:rEnd]
-    nose = shape[nStart:nEnd]
-
-    temp = leftEye
-    leftEye = rightEye
-    rightEye = temp
-
-    mar = mouth_aspect_ratio(mouth)
-    leftEAR = eye_aspect_ratio(leftEye)
-    rightEAR = eye_aspect_ratio(rightEye)
-    ear = (leftEAR + rightEAR) / 2.0
-    diff_ear = np.abs(leftEAR - rightEAR)
-    nose_point = (nose[3, 0], nose[3, 1])
-
-    cv2.drawContours(frame, [cv2.convexHull(mouth)], -1, YELLOW, 1)
-    cv2.drawContours(frame, [cv2.convexHull(leftEye)], -1, YELLOW, 1)
-    cv2.drawContours(frame, [cv2.convexHull(rightEye)], -1, YELLOW, 1)
-
-    for (x, y) in np.concatenate((mouth, leftEye, rightEye), axis=0):
-        cv2.circle(frame, (x, y), 2, GREEN, -1)
-
-    # Gesture logic
-    if diff_ear > WINK_AR_DIFF_THRESH:
-        if leftEAR < rightEAR and leftEAR < EYE_AR_THRESH:
+        # ========== WINK CLICK ==========
+        if LEFT_CLOSED and not RIGHT_CLOSED:      # wink left
             WINK_COUNTER += 1
-            if WINK_COUNTER > WINK_CONSECUTIVE_FRAMES:
-                pyag.click(button='left')
+            if WINK_COUNTER > WINK_FRAMES:
+                pyag.click(button="left")
                 WINK_COUNTER = 0
-        elif rightEAR < leftEAR and rightEAR < EYE_AR_THRESH:
+
+        elif RIGHT_CLOSED and not LEFT_CLOSED:    # wink right
             WINK_COUNTER += 1
-            if WINK_COUNTER > WINK_CONSECUTIVE_FRAMES:
-                pyag.click(button='right')
+            if WINK_COUNTER > WINK_FRAMES:
+                pyag.click(button="right")
                 WINK_COUNTER = 0
-    else:
-        if ear <= EYE_AR_THRESH:
-            EYE_COUNTER += 1
-            if EYE_COUNTER > EYE_AR_CONSECUTIVE_FRAMES:
-                SCROLL_MODE = not SCROLL_MODE
-                EYE_COUNTER = 0
         else:
-            EYE_COUNTER = 0
             WINK_COUNTER = 0
 
-    if mar > MOUTH_AR_THRESH:
-        MOUTH_COUNTER += 1
-        if MOUTH_COUNTER >= MOUTH_AR_CONSECUTIVE_FRAMES:
-            INPUT_MODE = not INPUT_MODE
+        # ========== SQUINT (both eyes) → Scroll Mode ==========
+        if leftEAR < SQUINT_THRESH and rightEAR < SQUINT_THRESH:
+            SQUINT_COUNTER += 1
+            if SQUINT_COUNTER > SQUINT_FRAMES:
+                SCROLL_MODE = not SCROLL_MODE
+                SQUINT_COUNTER = 0
+        else:
+            SQUINT_COUNTER = 0
+
+        # ========== Mouth → Input Mode ==========
+        if mar > MOUTH_AR_THRESH:
+            MOUTH_COUNTER += 1
+            if MOUTH_COUNTER > MOUTH_FRAMES:
+                INPUT_MODE = not INPUT_MODE
+                ANCHOR_POINT = nose
+                MOUTH_COUNTER = 0
+        else:
             MOUTH_COUNTER = 0
-            ANCHOR_POINT = nose_point
-    else:
-        MOUTH_COUNTER = 0
 
-    if INPUT_MODE:
-        cv2.putText(frame, "INPUT MODE ON", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, RED, 2)
-        x, y = ANCHOR_POINT
-        nx, ny = nose_point
-        w, h = 60, 35
-        cv2.rectangle(frame, (x - w, y - h), (x + w, y + h), GREEN, 2)
-        cv2.line(frame, ANCHOR_POINT, nose_point, BLUE, 2)
+        # ========== Movement ==========
+        if INPUT_MODE:
+            x, y = ANCHOR_POINT
+            nx, ny = nose
+            drag = 16
+            if SCROLL_MODE:
+                if ny < y - 35: pyag.scroll(40)
+                elif ny > y + 35: pyag.scroll(-40)
+            else:
+                if nx > x + 35: pyag.moveRel(drag, 0)
+                elif nx < x - 35: pyag.moveRel(-drag, 0)
+                if ny > y + 25: pyag.moveRel(0, drag)
+                elif ny < y - 25: pyag.moveRel(0, -drag)
 
-        direction_result = direction(nose_point, ANCHOR_POINT, w, h)
-        cv2.putText(frame, direction_result.upper(), (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, RED, 2)
-        drag = 20
+            cv2.putText(frame,
+                        "SCROLL MODE" if SCROLL_MODE else "INPUT MODE",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 0, 255), 2)
 
-        if direction_result == 'right':
-            pyag.moveRel(drag, 0)
-        elif direction_result == 'left':
-            pyag.moveRel(-drag, 0)
-        elif direction_result == 'up':
-            pyag.moveRel(0, -drag)
-        elif direction_result == 'down':
-            pyag.moveRel(0, drag)
+    # FPS
+    now = time.time()
+    fps = 1 / (now - prev)
+    prev = now
+    cv2.putText(frame, f"FPS: {int(fps)}",
+                (470, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
-    if SCROLL_MODE:
-        cv2.putText(frame, "SCROLL MODE ON", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, RED, 2)
+    cv2.imshow("Face Hands-Free Mouse", frame)
+    if cv2.waitKey(1) & 0xFF == 27: break
 
-    cv2.imshow("Frame", frame)
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-vid.release()
+cap.release()
 cv2.destroyAllWindows()
-
